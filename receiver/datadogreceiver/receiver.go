@@ -8,9 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-
 	pb "github.com/DataDog/datadog-agent/pkg/proto/pbgo/trace"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componentstatus"
@@ -18,9 +15,20 @@ import (
 	"go.opentelemetry.io/collector/receiver"
 	"go.opentelemetry.io/collector/receiver/receiverhelper"
 	"go.uber.org/zap"
+	"io"
+	"net/http"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/datadogreceiver/internal/translator"
 )
+
+// Endpoint specifies an API endpoint definition.
+type Endpoint struct {
+	// Pattern specifies the API pattern, as registered by the HTTP handler.
+	Pattern string
+
+	// Handler specifies the http.Handler for this endpoint.
+	Handler func(http.ResponseWriter, *http.Request)
+}
 
 type datadogReceiver struct {
 	address string
@@ -52,31 +60,95 @@ func newDataDogReceiver(config *Config, params receiver.Settings) (component.Com
 	}, nil
 }
 
-func (ddr *datadogReceiver) Start(ctx context.Context, host component.Host) error {
-	ddmux := http.NewServeMux()
-
-	ddmux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
+// endpoints specifies the list of endpoints registered for the trace-agent API.
+func (ddr *datadogReceiver) getEndpoints() []Endpoint {
+	endpoints := []Endpoint{
+		{
+			Pattern: "/",
+			Handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			},
+		},
+	}
 
 	if ddr.nextTracesConsumer != nil {
-		ddmux.HandleFunc("/v0.3/traces", ddr.handleTraces)
-		ddmux.HandleFunc("/v0.4/traces", ddr.handleTraces)
-		ddmux.HandleFunc("/v0.5/traces", ddr.handleTraces)
-		ddmux.HandleFunc("/v0.7/traces", ddr.handleTraces)
-		ddmux.HandleFunc("/api/v0.2/traces", ddr.handleTraces)
+		endpoints = append(endpoints, []Endpoint{
+			{
+				Pattern: "/v0.3/traces",
+				Handler: ddr.handleTraces,
+			},
+			{
+				Pattern: "/v0.4/traces",
+				Handler: ddr.handleTraces,
+			},
+			{
+				Pattern: "/v0.5/traces",
+				Handler: ddr.handleTraces,
+			},
+			{
+				Pattern: "/v0.7/traces",
+				Handler: ddr.handleTraces,
+			},
+			{
+				Pattern: "/api/v0.2/traces",
+				Handler: ddr.handleTraces,
+			},
+		}...)
 	}
 
 	if ddr.nextMetricsConsumer != nil {
-		ddr.metricsTranslator = translator.NewMetricsTranslator(ddr.params.BuildInfo)
+		endpoints = append(endpoints, []Endpoint{
+			{
+				Pattern: "/api/v1/series",
+				Handler: ddr.handleV1Series,
+			},
+			{
+				Pattern: "/api/v2/series",
+				Handler: ddr.handleV2Series,
+			},
+			{
+				Pattern: "/api/v1/check_run",
+				Handler: ddr.handleCheckRun,
+			},
+			{
+				Pattern: "/api/v1/sketches",
+				Handler: ddr.handleSketches,
+			},
+			{
+				Pattern: "/api/beta/sketches",
+				Handler: ddr.handleSketches,
+			},
+			{
+				Pattern: "/intake",
+				Handler: ddr.handleIntake,
+			},
+			{
+				Pattern: "/api/v1/distribution_points",
+				Handler: ddr.handleDistributionPoints,
+			},
+			{
+				Pattern: "/v0.6/stats",
+				Handler: ddr.handleStats,
+			},
+		}...)
+	}
 
-		ddmux.HandleFunc("/api/v1/series", ddr.handleV1Series)
-		ddmux.HandleFunc("/api/v2/series", ddr.handleV2Series)
-		ddmux.HandleFunc("/api/v1/check_run", ddr.handleCheckRun)
-		ddmux.HandleFunc("/api/v1/sketches", ddr.handleSketches)
-		ddmux.HandleFunc("/api/beta/sketches", ddr.handleSketches)
-		ddmux.HandleFunc("/intake", ddr.handleIntake)
-		ddmux.HandleFunc("/api/v1/distribution_points", ddr.handleDistributionPoints)
+	infoResponse, _ := ddr.buildInfoResponse(endpoints)
+
+	endpoints = append(endpoints, Endpoint{
+		Pattern: "/info",
+		Handler: func(w http.ResponseWriter, r *http.Request) { ddr.handleInfo(w, r, infoResponse) },
+	})
+
+	return endpoints
+}
+
+func (ddr *datadogReceiver) Start(ctx context.Context, host component.Host) error {
+	ddmux := http.NewServeMux()
+	endpoints := ddr.getEndpoints()
+
+	for _, e := range endpoints {
+		ddmux.HandleFunc(e.Pattern, e.Handler)
 	}
 
 	var err error
@@ -139,7 +211,6 @@ func (ddr *datadogReceiver) handleTraces(w http.ResponseWriter, req *http.Reques
 	}
 
 	_, _ = w.Write([]byte("OK"))
-
 }
 
 // handleV1Series handles the v1 series endpoint https://docs.datadoghq.com/api/latest/metrics/#submit-metrics
@@ -265,4 +336,59 @@ func (ddr *datadogReceiver) handleDistributionPoints(w http.ResponseWriter, req 
 	err = fmt.Errorf("distribution points endpoint not implemented")
 	http.Error(w, err.Error(), http.StatusMethodNotAllowed)
 	ddr.params.Logger.Warn("metrics consumer errored out", zap.Error(err))
+}
+
+func (ddr *datadogReceiver) buildInfoResponse(endpoints []Endpoint) ([]byte, error) {
+	var endpointPaths []string
+	for _, e := range endpoints {
+		endpointPaths = append(endpointPaths, e.Pattern)
+	}
+
+	return json.MarshalIndent(translator.Info{
+		Version:          fmt.Sprintf("datadogreceiver-%s-%s", ddr.params.BuildInfo.Command, ddr.params.BuildInfo.Version),
+		Endpoints:        endpointPaths,
+		ClientDropP0s:    false,
+		SpanMetaStructs:  false,
+		LongRunningSpans: false,
+	}, "", "\t")
+}
+
+// handleStats handles incoming stats payloads.
+func (ddr *datadogReceiver) handleInfo(w http.ResponseWriter, _ *http.Request, infoResponse []byte) {
+	_, err := fmt.Fprintf(w, "%s", infoResponse)
+
+	if err != nil {
+		ddr.params.Logger.Error("Error writing /info endpoint response", zap.Error(err))
+		http.Error(w, "Error writing /info endpoint response", http.StatusInternalServerError)
+		return
+	}
+}
+
+// handleStats handles incoming stats payloads.
+func (ddr *datadogReceiver) handleStats(w http.ResponseWriter, req *http.Request) {
+	obsCtx := ddr.tReceiver.StartMetricsOp(req.Context())
+	var err error
+	var metricsCount = 0
+	defer func(metricsCount *int) {
+		ddr.tReceiver.EndMetricsOp(obsCtx, "datadog", *metricsCount, err)
+	}(&metricsCount)
+
+	metrics, err := translator.TranslateStats(req)
+
+	if err != nil {
+		ddr.params.Logger.Error("Error decoding pb.ClientStatsPayload", zap.Error(err))
+		http.Error(w, "Error decoding pb.ClientStatsPayload", http.StatusBadRequest)
+		return
+	}
+
+	metricsCount = metrics.DataPointCount()
+
+	err = ddr.nextMetricsConsumer.ConsumeMetrics(obsCtx, metrics)
+	if err != nil {
+		ddr.params.Logger.Error("Metrics consumer errored out", zap.Error(err))
+		http.Error(w, "Metrics consumer errored out", http.StatusInternalServerError)
+		return
+	}
+
+	_, _ = w.Write([]byte("OK"))
 }

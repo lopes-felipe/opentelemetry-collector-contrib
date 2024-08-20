@@ -6,6 +6,7 @@ package translator // import "github.com/open-telemetry/opentelemetry-collector-
 import (
 	"bytes"
 	"fmt"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/datadogreceiver/internal/translator/header"
 	"io"
 	"net/http"
 	"testing"
@@ -85,9 +86,9 @@ func TestTracePayloadV05Unmarshalling(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, "/v0.5/traces", io.NopCloser(bytes.NewReader(payload)))
 
 	translated := ToTraces(&pb.TracerPayload{
-		LanguageName:    req.Header.Get("Datadog-Meta-Lang"),
-		LanguageVersion: req.Header.Get("Datadog-Meta-Lang-Version"),
-		TracerVersion:   req.Header.Get("Datadog-Meta-Tracer-Version"),
+		LanguageName:    req.Header.Get(header.Lang),
+		LanguageVersion: req.Header.Get(header.LangVersion),
+		TracerVersion:   req.Header.Get(header.TracerVersion),
 		Chunks:          traceChunksFromTraces(traces),
 	}, req)
 	assert.Equal(t, 1, translated.SpanCount(), "Span Count wrong")
@@ -191,7 +192,7 @@ func agentPayloadFromTraces(traces *pb.Traces) (agentPayload pb.AgentPayload) {
 func TestUpsertHeadersAttributes(t *testing.T) {
 	// Test case 1: Datadog-Meta-Tracer-Version is present in headers
 	req1, _ := http.NewRequest("GET", "http://example.com", nil)
-	req1.Header.Set("Datadog-Meta-Tracer-Version", "1.2.3")
+	req1.Header.Set(header.TracerVersion, "1.2.3")
 	attrs1 := pcommon.NewMap()
 	upsertHeadersAttributes(req1, attrs1)
 	val, ok := attrs1.Get(semconv.AttributeTelemetrySDKVersion)
@@ -200,7 +201,7 @@ func TestUpsertHeadersAttributes(t *testing.T) {
 
 	// Test case 2: Datadog-Meta-Lang is present in headers with ".NET"
 	req2, _ := http.NewRequest("GET", "http://example.com", nil)
-	req2.Header.Set("Datadog-Meta-Lang", ".NET")
+	req2.Header.Set(header.Lang, ".NET")
 	attrs2 := pcommon.NewMap()
 	upsertHeadersAttributes(req2, attrs2)
 	val, ok = attrs2.Get(semconv.AttributeTelemetrySDKLanguage)
