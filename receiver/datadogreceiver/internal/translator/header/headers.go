@@ -1,5 +1,8 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 // Package header defines HTTP headers known convention used by the Trace Agent and Datadog's APM intake.
-package header
+package header // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/datadogreceiver/internal/translator/header"
 
 const (
 	// Lang specifies the name of the header which contains the language from
